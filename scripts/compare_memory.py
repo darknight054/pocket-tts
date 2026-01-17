@@ -29,7 +29,6 @@ from pocket_tts.utils.utils import size_of_dict
 text = os.environ["POCKET_TTS_TEXT"]
 voice = os.environ["POCKET_TTS_VOICE"]
 variant = os.environ["POCKET_TTS_VARIANT"]
-frames_after_eos = int(os.environ["POCKET_TTS_FRAMES_AFTER_EOS"])
 iters = int(os.environ["POCKET_TTS_ITERS"])
 seed = int(os.environ["POCKET_TTS_SEED"])
 
@@ -76,12 +75,7 @@ rtfs = []
 audio_secs = []
 for _ in range(iters):
     t0 = time.perf_counter()
-    audio = tts.generate_audio(
-        model_state=state,
-        text_to_generate=text,
-        frames_after_eos=frames_after_eos,
-        copy_state=True,
-    )
+    audio = tts.generate_audio(model_state=state, text_to_generate=text, copy_state=True)
     elapsed = time.perf_counter() - t0
     audio_sec = audio.shape[-1] / tts.sample_rate if audio.numel() else 0.0
     rtf = audio_sec / elapsed if elapsed else float("inf")
@@ -157,7 +151,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional single prompt. If omitted, a built-in set of long prompts is used.",
     )
-    parser.add_argument("--frames-after-eos", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--keep-worktrees", action="store_true")
@@ -251,7 +244,6 @@ def main() -> None:
     base_env = {
         "POCKET_TTS_VOICE": args.voice,
         "POCKET_TTS_VARIANT": args.variant,
-        "POCKET_TTS_FRAMES_AFTER_EOS": str(args.frames_after_eos),
         "POCKET_TTS_ITERS": str(args.iters),
         "POCKET_TTS_SEED": str(args.seed),
     }
@@ -305,3 +297,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# uv run python scripts/compare_memory.py --baseline-ref upstream/main --candidate-ref reduced-memory-usage --iters 3 --frames-after-eos 1
