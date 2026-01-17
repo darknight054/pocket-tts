@@ -81,6 +81,13 @@ class QuantizerConfig(StrictModel):
     output_dimension: int
 
 
+class QuantizationConfig(StrictModel):
+    mode: str
+    scope: str = "flow_lm"
+    symmetric: bool = True
+    per_channel: bool = True
+
+
 # Root configuration
 class MimiConfig(StrictModel):
     """Root configuration model for Mimi YAML config files."""
@@ -108,6 +115,7 @@ class Config(StrictModel):
     mimi: MimiConfig
     weights_path: str | None = None
     weights_path_without_voice_cloning: str | None = None
+    quantization: QuantizationConfig | None = None
 
 
 def load_config(yaml_path: str | Path) -> Config:

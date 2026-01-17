@@ -128,7 +128,63 @@ def _load_ref_audio(path: str | Path, target_sr: int) -> torch.Tensor:
     return _to_mono(ref)
 
 
-def _compute_similarity(pred: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
+def _mel_filterbank(
+    sample_rate: int,
+    n_fft: int,
+    n_mels: int,
+    device: torch.device,
+    f_min: float = 0.0,
+    f_max: float | None = None,
+) -> torch.Tensor:
+    if f_max is None:
+        f_max = sample_rate / 2
+    m_min = 2595.0 * torch.log10(torch.tensor(1.0 + f_min / 700.0, device=device))
+    m_max = 2595.0 * torch.log10(torch.tensor(1.0 + f_max / 700.0, device=device))
+    m_pts = torch.linspace(m_min, m_max, n_mels + 2, device=device)
+    f_pts = 700.0 * (10.0 ** (m_pts / 2595.0) - 1.0)
+    bins = torch.floor((n_fft // 2 + 1) * f_pts / sample_rate).to(torch.int64)
+    fb = torch.zeros((n_mels, n_fft // 2 + 1), device=device)
+    for i in range(n_mels):
+        start, center, end = bins[i], bins[i + 1], bins[i + 2]
+        if center <= start:
+            center = start + 1
+        if end <= center:
+            end = center + 1
+        fb[i, start:center] = (torch.arange(start, center, device=device) - start) / (
+            center - start
+        )
+        fb[i, center:end] = (end - torch.arange(center, end, device=device)) / (end - center)
+    return fb
+
+
+def _mel_spectrogram(
+    audio: torch.Tensor,
+    sample_rate: int,
+    n_fft: int = 1024,
+    hop_length: int = 256,
+    n_mels: int = 80,
+) -> torch.Tensor:
+    audio = _to_mono(audio).detach().cpu().float()
+    if audio.numel() == 0:
+        return torch.empty((n_mels, 0))
+    window = torch.hann_window(n_fft)
+    spec = torch.stft(
+        audio,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=n_fft,
+        window=window,
+        return_complex=True,
+    )
+    mag = spec.abs().pow(2.0)
+    fb = _mel_filterbank(sample_rate, n_fft, n_mels, device=mag.device)
+    mel = fb @ mag
+    return torch.log(mel + 1e-6)
+
+
+def _compute_similarity(
+    pred: torch.Tensor, ref: torch.Tensor, sample_rate: int
+) -> dict[str, float]:
     pred = _to_mono(pred).detach().cpu().float()
     ref = _to_mono(ref).detach().cpu().float()
     length = min(pred.shape[-1], ref.shape[-1])
@@ -144,7 +200,21 @@ def _compute_similarity(pred: torch.Tensor, ref: torch.Tensor) -> dict[str, floa
     noise = torch.mean(diff**2).item()
     eps = 1e-12
     snr = 10.0 * torch.log10(torch.tensor((signal + eps) / (noise + eps))).item()
-    return {"mse": mse, "mae": mae, "cosine": cos, "snr_db": snr}
+    metrics = {"mse": mse, "mae": mae, "cosine": cos, "snr_db": snr}
+    mel_pred = _mel_spectrogram(pred, sample_rate)
+    mel_ref = _mel_spectrogram(ref, sample_rate)
+    mel_len = min(mel_pred.shape[-1], mel_ref.shape[-1])
+    if mel_len > 0:
+        mel_pred = mel_pred[..., :mel_len]
+        mel_ref = mel_ref[..., :mel_len]
+        mel_diff = mel_pred - mel_ref
+        mel_mse = torch.mean(mel_diff**2).item()
+        mel_mae = torch.mean(torch.abs(mel_diff)).item()
+        mel_cos = torch.nn.functional.cosine_similarity(
+            mel_pred.flatten(), mel_ref.flatten(), dim=0
+        ).item()
+        metrics.update({"mel_mse": mel_mse, "mel_mae": mel_mae, "mel_cosine": mel_cos})
+    return metrics
 
 
 def build_model_state(tts_model: TTSModel, voice: str, truncate: bool) -> dict:
@@ -225,6 +295,9 @@ def main() -> None:
     mae_vals = []
     cos_vals = []
     snr_vals = []
+    mel_mse_vals = []
+    mel_mae_vals = []
+    mel_cos_vals = []
     saved_audio_path = None
     missing_ref = 0
     for _ in range(args.iters):
@@ -241,12 +314,16 @@ def main() -> None:
         rtfs.append(rtf)
         audio_secs.append(audio_sec)
         if ref_audio is not None:
-            metrics = _compute_similarity(audio, ref_audio)
+            metrics = _compute_similarity(audio, ref_audio, tts_model.sample_rate)
             if metrics:
                 mse_vals.append(metrics["mse"])
                 mae_vals.append(metrics["mae"])
                 cos_vals.append(metrics["cosine"])
                 snr_vals.append(metrics["snr_db"])
+                if "mel_mse" in metrics:
+                    mel_mse_vals.append(metrics["mel_mse"])
+                    mel_mae_vals.append(metrics["mel_mae"])
+                    mel_cos_vals.append(metrics["mel_cosine"])
         if args.save_audio and iter_idx == args.save_audio_iter:
             voice_tag = _safe_tag(args.voice)
             text_tag = _slugify(args.text)
@@ -259,12 +336,16 @@ def main() -> None:
                     ref_path = compare_dir / filename
                     if ref_path.exists():
                         ref_audio = _load_ref_audio(ref_path, tts_model.sample_rate)
-                        metrics = _compute_similarity(audio, ref_audio)
+                        metrics = _compute_similarity(audio, ref_audio, tts_model.sample_rate)
                         if metrics:
                             mse_vals.append(metrics["mse"])
                             mae_vals.append(metrics["mae"])
                             cos_vals.append(metrics["cosine"])
                             snr_vals.append(metrics["snr_db"])
+                            if "mel_mse" in metrics:
+                                mel_mse_vals.append(metrics["mel_mse"])
+                                mel_mae_vals.append(metrics["mel_mae"])
+                                mel_cos_vals.append(metrics["mel_cosine"])
                     else:
                         missing_ref += 1
 
@@ -299,6 +380,10 @@ def main() -> None:
         print(f"similarity_mae_median={statistics.median(mae_vals):.6f}")
         print(f"similarity_cosine_median={statistics.median(cos_vals):.6f}")
         print(f"similarity_snr_db_median={statistics.median(snr_vals):.3f}")
+        if mel_mse_vals:
+            print(f"similarity_mel_mse_median={statistics.median(mel_mse_vals):.6f}")
+            print(f"similarity_mel_mae_median={statistics.median(mel_mae_vals):.6f}")
+            print(f"similarity_mel_cosine_median={statistics.median(mel_cos_vals):.6f}")
     if missing_ref:
         print(f"similarity_missing_ref_count={missing_ref}")
 

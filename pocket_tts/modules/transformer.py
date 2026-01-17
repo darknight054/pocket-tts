@@ -58,20 +58,30 @@ class StreamingMultiheadAttention(StatefulModule):
         mult = 1
         self.in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, mult * embed_dim, bias=False)
+        # Cache dtype should remain float even if Linear layers are swapped later.
+        self._kv_cache_dtype = self.in_proj.weight.dtype
+
+    def _kv_cache_device(self) -> torch.device:
+        for tensor in self.parameters():
+            return tensor.device
+        for tensor in self.buffers():
+            return tensor.device
+        return torch.device("cpu")
 
     def _get_mask(self, shape: tuple[int, int], shift: int, device: torch.device) -> torch.Tensor:
         return _materialize_causal_mask(shape, shift=shift, device=device)
 
     def init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
         dim_per_head = self.embed_dim // self.num_heads
-        initial_current_end = torch.zeros((0,)).to(self.in_proj.weight.device)
+        device = self._kv_cache_device()
+        initial_current_end = torch.zeros((0,), device=device)
         return dict(
             current_end=initial_current_end,
             cache=torch.full(
                 (2, batch_size, sequence_length, self.num_heads, dim_per_head),
                 float("NaN"),
-                device=self.in_proj.weight.device,
-                dtype=self.in_proj.weight.dtype,
+                device=device,
+                dtype=self._kv_cache_dtype,
             ),
         )
 
