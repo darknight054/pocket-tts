@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 
@@ -22,6 +23,7 @@ import time
 
 import torch
 
+from pocket_tts.data.audio import stream_audio_chunks
 from pocket_tts.models.tts_model import TTSModel
 from pocket_tts.modules.transformer import StreamingMultiheadAttention
 from pocket_tts.utils.utils import size_of_dict
@@ -31,6 +33,10 @@ voice = os.environ["POCKET_TTS_VOICE"]
 variant = os.environ["POCKET_TTS_VARIANT"]
 iters = int(os.environ["POCKET_TTS_ITERS"])
 seed = int(os.environ["POCKET_TTS_SEED"])
+save_audio = os.environ.get("POCKET_TTS_SAVE_AUDIO", "0") == "1"
+audio_dir = os.environ.get("POCKET_TTS_AUDIO_DIR", "")
+label = os.environ.get("POCKET_TTS_LABEL", "run")
+prompt_index = os.environ.get("POCKET_TTS_PROMPT_INDEX", "0")
 
 torch.manual_seed(seed)
 
@@ -73,6 +79,7 @@ if hasattr(tts, "_ensure_flow_lm_cache_capacity"):
 times = []
 rtfs = []
 audio_secs = []
+saved_audio_path = None
 for _ in range(iters):
     t0 = time.perf_counter()
     audio = tts.generate_audio(model_state=state, text_to_generate=text, copy_state=True)
@@ -82,6 +89,20 @@ for _ in range(iters):
     times.append(elapsed)
     rtfs.append(rtf)
     audio_secs.append(audio_sec)
+    if save_audio and saved_audio_path is None:
+        from hashlib import sha1
+
+        def _save_audio(audio_tensor, path: str, sample_rate: int) -> None:
+            if audio_tensor.dim() == 2 and audio_tensor.shape[0] == 1:
+                audio_tensor = audio_tensor[0]
+            audio_tensor = audio_tensor.detach().cpu()
+            stream_audio_chunks(path, iter([audio_tensor]), sample_rate)
+
+        text_hash = sha1(text.encode("utf-8")).hexdigest()[:8]
+        filename = f"{label}_{int(prompt_index):02d}_{text_hash}.wav"
+        os.makedirs(audio_dir, exist_ok=True)
+        saved_audio_path = os.path.join(audio_dir, filename)
+        _save_audio(audio, saved_audio_path, tts.sample_rate)
 
 result = {
     "token_count": token_count,
@@ -96,6 +117,7 @@ result = {
     "time_sec_median": statistics.median(times),
     "rtf_median": statistics.median(rtfs),
     "audio_sec_median": statistics.median(audio_secs),
+    "audio_path": saved_audio_path,
 }
 print(json.dumps(result))
 """
@@ -153,6 +175,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--save-audio", action="store_true")
+    parser.add_argument("--audio-dir", default="audios")
+    parser.add_argument("--run-id", default=None)
     parser.add_argument("--keep-worktrees", action="store_true")
     return parser.parse_args()
 
@@ -237,9 +262,14 @@ def main() -> None:
         temp_paths.append(candidate_path)
 
     prompts = [args.text] if args.text else DEFAULT_PROMPTS
-    prompts = _ensure_min_words(prompts, min_words=30)
+    prompts = _ensure_min_words(prompts, min_words=40)
     if len(prompts) < 10:
         raise ValueError(f"Need at least 10 prompts, found {len(prompts)}")
+
+    run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
+    audio_root = (repo_root / args.audio_dir / run_id).resolve()
+    if args.save_audio:
+        audio_root.mkdir(parents=True, exist_ok=True)
 
     base_env = {
         "POCKET_TTS_VOICE": args.voice,
@@ -247,13 +277,18 @@ def main() -> None:
         "POCKET_TTS_ITERS": str(args.iters),
         "POCKET_TTS_SEED": str(args.seed),
     }
+    if args.save_audio:
+        base_env["POCKET_TTS_SAVE_AUDIO"] = "1"
+        base_env["POCKET_TTS_AUDIO_DIR"] = str(audio_root)
 
     try:
         baseline_runs = []
         candidate_runs = []
         for idx, prompt in enumerate(prompts, start=1):
-            env = {**base_env, "POCKET_TTS_TEXT": prompt}
+            env = {**base_env, "POCKET_TTS_TEXT": prompt, "POCKET_TTS_PROMPT_INDEX": str(idx)}
+            env["POCKET_TTS_LABEL"] = "baseline"
             baseline = _run_in_repo(baseline_path, env)
+            env["POCKET_TTS_LABEL"] = "candidate"
             candidate = _run_in_repo(candidate_path, env)
             baseline_runs.append(baseline)
             candidate_runs.append(candidate)
@@ -298,4 +333,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# uv run python scripts/compare_memory.py --baseline-ref upstream/main --candidate-ref reduced-memory-usage --iters 3 --frames-after-eos 1
+# uv run python scripts/compare_memory.py --baseline-ref upstream/main --candidate-ref reduced-memory-usage --iters 3
