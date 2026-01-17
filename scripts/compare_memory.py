@@ -8,11 +8,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 
 def _run_in_repo(repo_path: Path, env: dict) -> dict:
-    code = r"""
+    code = textwrap.dedent(
+        """
 import json
 import os
 import statistics
@@ -103,6 +105,7 @@ result = {
 }
 print(json.dumps(result))
 """
+    )
     cmd = [sys.executable, "-c", code]
     env = {**os.environ, **env}
     env["PYTHONPATH"] = str(repo_path)
@@ -149,12 +152,80 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-path", default=None)
     parser.add_argument("--variant", default="b6369a24")
     parser.add_argument("--voice", default="alba")
-    parser.add_argument("--text", default="Hello there. This is a quick speed test.")
+    parser.add_argument(
+        "--text",
+        default=None,
+        help="Optional single prompt. If omitted, a built-in set of long prompts is used.",
+    )
     parser.add_argument("--frames-after-eos", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--keep-worktrees", action="store_true")
     return parser.parse_args()
+
+
+DEFAULT_PROMPTS = [
+    (
+        "When I started timing this model, I expected small gains, but the memory profile told a "
+        "different story, and I want a consistent run that stresses streaming generation while "
+        "still sounding natural, so this sentence is deliberately long and descriptive."
+    ),
+    (
+        "We should measure performance on a passage that mixes short and long clauses, includes "
+        "commas and conjunctions, and keeps the speech flowing, because that better represents "
+        "real usage than a tiny prompt or a single phrase."
+    ),
+    (
+        "A longer benchmark prompt is useful because it warms the transformer, exercises the "
+        "autoregressive loop, and gives the decoder enough frames to reveal whether cache sizing "
+        "is helping or hurting across multiple attention layers."
+    ),
+    (
+        "To make this test meaningful, I am describing a brief narrative about calibrating a "
+        "speech model, checking the latency, watching the audio stream, and comparing a baseline "
+        "path against an optimized path, all in one breath."
+    ),
+    (
+        "This is another extended sentence that keeps the model busy, includes varied vocabulary, "
+        "and should provide enough tokens to observe consistent behavior from the KV cache, which "
+        "is exactly what we need for a trustworthy comparison."
+    ),
+    (
+        "If the benchmark prompt is too short, the results swing wildly, so I am adding this "
+        "longer sentence to stabilize the measurement, capture steady state, and reduce the "
+        "effect of one-off overheads."
+    ),
+    (
+        "The purpose here is to generate audio that is long enough to reveal performance trends, "
+        "yet not so long that the test is impractical, which is why I am writing this long "
+        "sentence with clear pacing and multiple clauses."
+    ),
+    (
+        "In practice, a prompt like this may be read aloud in a tutorial or a product demo, "
+        "and it should be long enough to show the time-to-first-audio and the sustained speed, "
+        "so we can compare baseline and reduced-memory runs."
+    ),
+    (
+        "We also want a prompt that exercises punctuation, spacing, and a few numbers like twenty "
+        "five or seventy two, and still remains a single cohesive line of speech to keep the "
+        "measurement consistent across runs."
+    ),
+    (
+        "Finally, this long sentence provides a stable target for regression testing, and it "
+        "ensures that the measured differences reflect cache sizing and dtype behavior rather "
+        "than random variance from tiny or irregular prompts."
+    ),
+]
+
+
+def _ensure_min_words(prompts: list[str], min_words: int) -> list[str]:
+    filtered: list[str] = []
+    for prompt in prompts:
+        word_count = len(prompt.split())
+        if word_count < min_words:
+            raise ValueError(f"Prompt too short ({word_count} words, min {min_words}): {prompt}")
+        filtered.append(prompt)
+    return filtered
 
 
 def main() -> None:
@@ -172,8 +243,12 @@ def main() -> None:
         candidate_path = _add_worktree(repo_root, args.candidate_ref)
         temp_paths.append(candidate_path)
 
-    env = {
-        "POCKET_TTS_TEXT": args.text,
+    prompts = [args.text] if args.text else DEFAULT_PROMPTS
+    prompts = _ensure_min_words(prompts, min_words=30)
+    if len(prompts) < 10:
+        raise ValueError(f"Need at least 10 prompts, found {len(prompts)}")
+
+    base_env = {
         "POCKET_TTS_VOICE": args.voice,
         "POCKET_TTS_VARIANT": args.variant,
         "POCKET_TTS_FRAMES_AFTER_EOS": str(args.frames_after_eos),
@@ -182,37 +257,50 @@ def main() -> None:
     }
 
     try:
-        baseline = _run_in_repo(baseline_path, env)
-        candidate = _run_in_repo(candidate_path, env)
+        baseline_runs = []
+        candidate_runs = []
+        for idx, prompt in enumerate(prompts, start=1):
+            env = {**base_env, "POCKET_TTS_TEXT": prompt}
+            baseline = _run_in_repo(baseline_path, env)
+            candidate = _run_in_repo(candidate_path, env)
+            baseline_runs.append(baseline)
+            candidate_runs.append(candidate)
+            print(
+                "prompt_result "
+                f"index={idx} words={baseline['word_count']} "
+                f"baseline_prompt_mb={baseline['state_mb_prompt']:.2f} "
+                f"candidate_prompt_mb={candidate['state_mb_prompt']:.2f} "
+                f"baseline_rtf={baseline['rtf_median']:.3f} "
+                f"candidate_rtf={candidate['rtf_median']:.3f}"
+            )
     finally:
         if not args.keep_worktrees:
             for path in temp_paths:
                 _remove_worktree(repo_root, path)
 
-    reduction = None
-    if baseline["state_mb_prompt"] and candidate["state_mb_prompt"]:
-        reduction = baseline["state_mb_prompt"] / candidate["state_mb_prompt"]
-    rtf_gain = None
-    if baseline["rtf_median"] and candidate["rtf_median"]:
-        rtf_gain = candidate["rtf_median"] / baseline["rtf_median"]
+    def _median(values):
+        return sorted(values)[len(values) // 2]
+
+    baseline_mb = [item["state_mb_prompt"] for item in baseline_runs]
+    candidate_mb = [item["state_mb_prompt"] for item in candidate_runs]
+    baseline_rtf = [item["rtf_median"] for item in baseline_runs]
+    candidate_rtf = [item["rtf_median"] for item in candidate_runs]
+
+    reduction = _median([b / c for b, c in zip(baseline_mb, candidate_mb)])
+    rtf_gain = _median([c / b for b, c in zip(baseline_rtf, candidate_rtf)])
+    baseline_audio = _median([item["audio_sec_median"] for item in baseline_runs])
+    candidate_audio = _median([item["audio_sec_median"] for item in candidate_runs])
 
     print("compare_result")
-    print(f"baseline_prompt_mb={baseline['state_mb_prompt']:.2f}")
-    print(f"candidate_prompt_mb={candidate['state_mb_prompt']:.2f}")
-    if reduction is not None:
-        print(f"prompt_mb_reduction_x={reduction:.2f}")
-    print(f"baseline_rtf_median={baseline['rtf_median']:.3f}")
-    print(f"candidate_rtf_median={candidate['rtf_median']:.3f}")
-    if rtf_gain is not None:
-        print(f"rtf_gain_x={rtf_gain:.2f}")
-    print(f"baseline_audio_sec_median={baseline['audio_sec_median']:.3f}")
-    print(f"candidate_audio_sec_median={candidate['audio_sec_median']:.3f}")
-    print(f"baseline_cache_len_prompt={baseline['cache_len_prompt']}")
-    print(f"candidate_cache_len_prompt={candidate['cache_len_prompt']}")
-    if baseline["cache_len_estimate"] is not None:
-        print(f"baseline_cache_len_estimate={baseline['cache_len_estimate']}")
-    if candidate["cache_len_estimate"] is not None:
-        print(f"candidate_cache_len_estimate={candidate['cache_len_estimate']}")
+    print(f"prompts={len(prompts)}")
+    print(f"baseline_prompt_mb_median={_median(baseline_mb):.2f}")
+    print(f"candidate_prompt_mb_median={_median(candidate_mb):.2f}")
+    print(f"prompt_mb_reduction_x_median={reduction:.2f}")
+    print(f"baseline_rtf_median={_median(baseline_rtf):.3f}")
+    print(f"candidate_rtf_median={_median(candidate_rtf):.3f}")
+    print(f"rtf_gain_x_median={rtf_gain:.2f}")
+    print(f"baseline_audio_sec_median={baseline_audio:.3f}")
+    print(f"candidate_audio_sec_median={candidate_audio:.3f}")
 
 
 if __name__ == "__main__":

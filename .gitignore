@@ -61,6 +61,7 @@ dataset/*
 /notebooks
 /local_scripts
 /notes
+/benchmarks
 
 # cython output
 /audiocraft/metrics/abx/*.c
